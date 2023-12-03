@@ -586,6 +586,9 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
         self.register_to_config(force_zeros_for_empty_prompt=force_zeros_for_empty_prompt)
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+        self.mask_processor = VaeImageProcessor(
+            vae_scale_factor=self.vae_scale_factor, do_normalize=False, do_binarize=True, do_convert_grayscale=True
+        )
         self.default_sample_size = self.unet.config.sample_size
 
         add_watermarker = add_watermarker if add_watermarker is not None else is_invisible_watermark_available()
@@ -983,6 +986,7 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
     def prepare_latents(
         self,
         image,
+        mask,
         width,
         height,
         num_channels_latents,
@@ -994,6 +998,9 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
         generator=None,
         add_noise=True,
         latents=None,
+        is_strength_max=True,
+        return_noise=False,
+        return_image_latents=False,
     ):
         if image is None:
             shape = (batch_size, num_channels_latents, height // self.vae_scale_factor, width // self.vae_scale_factor)
@@ -1012,7 +1019,7 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
             latents = latents * self.scheduler.init_noise_sigma
             return latents
 
-        else:
+        elif mask is None:
             if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
                 raise ValueError(
                     f"`image` has to be of type `torch.Tensor`, `PIL.Image.Image` or list but is {type(image)}"
@@ -1024,7 +1031,6 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
                 torch.cuda.empty_cache()
 
             image = image.to(device=device, dtype=dtype)
-
             batch_size = batch_size * num_images_per_prompt
 
             if image.shape[1] == 4:
@@ -1075,8 +1081,128 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
                 init_latents = self.scheduler.add_noise(init_latents, noise, timestep)
 
             latents = init_latents
-
             return latents
+
+        else:
+            shape = (batch_size, num_channels_latents, height // self.vae_scale_factor, width // self.vae_scale_factor)
+            if isinstance(generator, list) and len(generator) != batch_size:
+                raise ValueError(
+                    f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                    f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+                )
+
+            if (image is None or timestep is None) and not is_strength_max:
+                raise ValueError(
+                    "Since strength < 1. initial latents are to be initialised as a combination of Image + Noise."
+                    "However, either the image or the noise timestep has not been provided."
+                )
+
+            if image.shape[1] == 4:
+                image_latents = image.to(device=device, dtype=dtype)
+                image_latents = image_latents.repeat(batch_size // image_latents.shape[0], 1, 1, 1)
+            elif return_image_latents or (latents is None and not is_strength_max):
+                image = image.to(device=device, dtype=dtype)
+                image_latents = self._encode_vae_image(image=image, generator=generator)
+                image_latents = image_latents.repeat(batch_size // image_latents.shape[0], 1, 1, 1)
+
+            if latents is None and add_noise:
+                noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+                # if strength is 1. then initialise the latents to noise, else initial to image + noise
+                latents = noise if is_strength_max else self.scheduler.add_noise(image_latents, noise, timestep)
+                # if pure noise then scale the initial latents by the  Scheduler's init sigma
+                latents = latents * self.scheduler.init_noise_sigma if is_strength_max else latents
+            elif add_noise:
+                noise = latents.to(device)
+                latents = noise * self.scheduler.init_noise_sigma
+            else:
+                noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+                latents = image_latents.to(device)
+
+            outputs = (latents,)
+
+            if return_noise:
+                outputs += (noise,)
+
+            if return_image_latents:
+                outputs += (image_latents,)
+
+            return outputs
+
+    def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
+        dtype = image.dtype
+        if self.vae.config.force_upcast:
+            image = image.float()
+            self.vae.to(dtype=torch.float32)
+
+        if isinstance(generator, list):
+            image_latents = [
+                retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i])
+                for i in range(image.shape[0])
+            ]
+            image_latents = torch.cat(image_latents, dim=0)
+        else:
+            image_latents = retrieve_latents(self.vae.encode(image), generator=generator)
+
+        if self.vae.config.force_upcast:
+            self.vae.to(dtype)
+
+        image_latents = image_latents.to(dtype)
+        image_latents = self.vae.config.scaling_factor * image_latents
+
+        return image_latents
+
+    def prepare_mask_latents(
+        self, mask, masked_image, batch_size, height, width, dtype, device, generator, do_classifier_free_guidance
+    ):
+        # resize the mask to latents shape as we concatenate the mask to the latents
+        # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
+        # and half precision
+        mask = torch.nn.functional.interpolate(
+            mask, size=(height // self.vae_scale_factor, width // self.vae_scale_factor)
+        )
+        mask = mask.to(device=device, dtype=dtype)
+
+        # duplicate mask and masked_image_latents for each generation per prompt, using mps friendly method
+        if mask.shape[0] < batch_size:
+            if not batch_size % mask.shape[0] == 0:
+                raise ValueError(
+                    "The passed mask and the required batch size don't match. Masks are supposed to be duplicated to"
+                    f" a total batch size of {batch_size}, but {mask.shape[0]} masks were passed. Make sure the number"
+                    " of masks that you pass is divisible by the total requested batch size."
+                )
+            mask = mask.repeat(batch_size // mask.shape[0], 1, 1, 1)
+
+        mask = torch.cat([mask] * 2) if do_classifier_free_guidance else mask
+
+        if masked_image is not None and masked_image.shape[1] == 4:
+            masked_image_latents = masked_image
+        else:
+            masked_image_latents = None
+
+        if masked_image is not None:
+            if masked_image_latents is None:
+                masked_image = masked_image.to(device=device, dtype=dtype)
+                masked_image_latents = self._encode_vae_image(masked_image, generator=generator)
+
+            if masked_image_latents.shape[0] < batch_size:
+                if not batch_size % masked_image_latents.shape[0] == 0:
+                    raise ValueError(
+                        "The passed images and the required batch size don't match. Images are supposed to be duplicated"
+                        f" to a total batch size of {batch_size}, but {masked_image_latents.shape[0]} images were passed."
+                        " Make sure the number of images that you pass is divisible by the total requested batch size."
+                    )
+                masked_image_latents = masked_image_latents.repeat(
+                    batch_size // masked_image_latents.shape[0], 1, 1, 1
+                )
+
+            masked_image_latents = (
+                torch.cat([masked_image_latents] * 2) if do_classifier_free_guidance else masked_image_latents
+            )
+
+            # aligning device to prevent device errors when concating it with the latent model input
+            masked_image_latents = masked_image_latents.to(device=device, dtype=dtype)
+
+        return mask, masked_image_latents
 
     def _get_add_time_ids(self, original_size, crops_coords_top_left, target_size, dtype):
         add_time_ids = list(original_size + crops_coords_top_left + target_size)
@@ -1153,6 +1279,7 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
         prompt_2: Optional[str] = None,
         image: Optional[PipelineImageInput] = None,
         mask_image: Optional[PipelineImageInput] = None,
+        masked_image_latents: Optional[torch.FloatTensor] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         strength: float = 0.8,
@@ -1164,7 +1291,6 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
         negative_prompt: Optional[str] = None,
         negative_prompt_2: Optional[str] = None,
         num_images_per_prompt: Optional[int] = 1,
-        add_predicted_noise: bool = False,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,
@@ -1247,9 +1373,6 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
                 `text_encoder_2`. If not defined, `negative_prompt` is used in both text-encoders
             num_images_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
-            add_predicted_noise (`bool`, *optional*, defaults to True):
-                Use predicted noise instead of random noise when constructing noisy versions of the original image in
-                the reverse diffusion process
             eta (`float`, *optional*, defaults to 0.0):
                 Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
                 [`schedulers.DDIMScheduler`], will be ignored for others.
@@ -1377,16 +1500,26 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
         dtype = prompt_embeds.dtype
 
         if isinstance(image, PIL.Image.Image):
-            image = self.image_processor.preprocess(image)
+            image = self.image_processor.preprocess(image, height=height, width=width)
         if image is not None:
             image = image.to(device=self.device, dtype=dtype)
-        # if isinstance(mask_image, PIL.Image.Image):
-        #     mask_image = preprocess_mask(mask_image, batch_size, self.vae_scale_factor)
-        # if mask_image is not None:
-        #     mask = mask_image.to(device=self.device, dtype=dtype)
-        #     mask = torch.cat([mask] * num_images_per_prompt)
-        # else:
-        #     mask = None
+
+        if isinstance(mask_image, PIL.Image.Image):
+            mask = self.mask_processor.preprocess(mask_image, height=height, width=width)
+        else:
+            mask = mask_image
+        if mask_image is not None:
+            mask = mask.to(device=self.device, dtype=dtype)
+
+            if masked_image_latents is not None:
+                masked_image = masked_image_latents
+            elif image.shape[1] == 4:
+                # if image is in latent space, we can't mask it
+                masked_image = None
+            else:
+                masked_image = image * (mask < 0.5)
+        else:
+            mask = None
 
         # 4. Prepare timesteps
         def denoising_value_valid(dnv):
@@ -1400,25 +1533,79 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
                 device,
                 denoising_start=self.denoising_start if denoising_value_valid else None,
             )
+
+            # check that number of inference steps is not < 1 - as this doesn't make sense
+            if num_inference_steps < 1:
+                raise ValueError(
+                    f"After adjusting the num_inference_steps by strength parameter: {strength}, the number of pipeline"
+                    f"steps is {num_inference_steps} which is < 1 and not appropriate for this pipeline."
+                )
+
         latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
+        is_strength_max = strength == 1.0
         add_noise = True if self.denoising_start is None else False
 
         # 5. Prepare latent variables
-        num_channels_latents = self.unet.config.in_channels
+        num_channels_latents = self.vae.config.latent_channels
+        num_channels_unet = self.unet.config.in_channels
+        return_image_latents = num_channels_unet == 4
+
         latents = self.prepare_latents(
-            image,
-            width,
-            height,
-            num_channels_latents,
-            latent_timestep,
-            batch_size,
-            num_images_per_prompt,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            add_noise,
-            latents,
+            image=image,
+            mask=mask,
+            width=width,
+            height=height,
+            num_channels_latents=num_channels_unet,
+            timestep=latent_timestep,
+            batch_size=batch_size,
+            num_images_per_prompt=num_images_per_prompt,
+            dtype=prompt_embeds.dtype,
+            device=device,
+            generator=generator,
+            add_noise=add_noise,
+            latents=latents,
+            is_strength_max=is_strength_max,
+            return_noise=True,
+            return_image_latents=return_image_latents,
         )
+
+        if mask is not None:
+            if return_image_latents:
+                latents, noise, image_latents = latents
+            else:
+                latents, noise = latents
+
+        # 5.1. Prepare mask latent variables
+        if mask is not None:
+            mask, masked_image_latents = self.prepare_mask_latents(
+                mask=mask,
+                masked_image=masked_image,
+                batch_size=batch_size * num_images_per_prompt,
+                height=height,
+                width=width,
+                dtype=prompt_embeds.dtype,
+                device=device,
+                generator=generator,
+                do_classifier_free_guidance=self.do_classifier_free_guidance,
+            )
+
+            # 8. Check that sizes of mask, masked image and latents match
+            if num_channels_unet == 9:
+                # default case for runwayml/stable-diffusion-inpainting
+                num_channels_mask = mask.shape[1]
+                num_channels_masked_image = masked_image_latents.shape[1]
+                if num_channels_latents + num_channels_mask + num_channels_masked_image != num_channels_unet:
+                    raise ValueError(
+                        f"Incorrect configuration settings! The config of `pipeline.unet`: {self.unet.config} expects"
+                        f" {self.unet.config.in_channels} but received `num_channels_latents`: {num_channels_latents} +"
+                        f" `num_channels_mask`: {num_channels_mask} + `num_channels_masked_image`: {num_channels_masked_image}"
+                        f" = {num_channels_latents+num_channels_masked_image+num_channels_mask}. Please verify the config of"
+                        " `pipeline.unet` or your `mask_image` or `image` input."
+                    )
+            elif num_channels_unet != 4:
+                raise ValueError(
+                    f"The unet {self.unet.__class__} should have either 4 or 9 input channels, not {self.unet.config.in_channels}."
+                )
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -1445,7 +1632,6 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
         add_text_embeds = add_text_embeds.to(device)
         add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
 
-        # 8. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
 
         # 7.1 Apply denoising_end
@@ -1470,8 +1656,17 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
             num_inference_steps = len(list(filter(lambda ts: ts >= discrete_timestep_cutoff, timesteps)))
             timesteps = timesteps[:num_inference_steps]
 
+        # 8. Optionally get Guidance Scale Embedding
+        timestep_cond = None
+        if self.unet.config.time_cond_proj_dim is not None:
+            guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(batch_size * num_images_per_prompt)
+            timestep_cond = self.get_guidance_scale_embedding(
+                guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
+            ).to(device=device, dtype=latents.dtype)
+
         self._num_timesteps = len(timesteps)
 
+        # 9. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
@@ -1479,13 +1674,17 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
 
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
+                if mask is not None and num_channels_unet == 9:
+                    latent_model_input = torch.cat([latent_model_input, mask, masked_image_latents], dim=1)
+
                 # predict the noise residual
                 added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
                 noise_pred = self.unet(
                     latent_model_input,
                     t,
                     encoder_hidden_states=prompt_embeds,
-                    cross_attention_kwargs=cross_attention_kwargs,
+                    timestep_cond=timestep_cond,
+                    cross_attention_kwargs=self.cross_attention_kwargs,
                     added_cond_kwargs=added_cond_kwargs,
                     return_dict=False,
                 )[0]
@@ -1501,6 +1700,22 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+
+                if mask is not None and num_channels_unet == 4:
+                    init_latents_proper = image_latents
+
+                    if self.do_classifier_free_guidance:
+                        init_mask, _ = mask.chunk(2)
+                    else:
+                        init_mask = mask
+
+                    if i < len(timesteps) - 1:
+                        noise_timestep = timesteps[i + 1]
+                        init_latents_proper = self.scheduler.add_noise(
+                            init_latents_proper, noise, torch.tensor([noise_timestep])
+                        )
+
+                    latents = (1 - init_mask) * init_latents_proper + init_mask * latents
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
@@ -1555,7 +1770,6 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
         negative_prompt: Optional[str] = None,
         negative_prompt_2: Optional[str] = None,
         num_images_per_prompt: Optional[int] = 1,
-        add_predicted_noise: bool = False,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,
@@ -1586,7 +1800,6 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
             negative_prompt=negative_prompt,
             negative_prompt_2=negative_prompt_2,
             num_images_per_prompt=num_images_per_prompt,
-            add_predicted_noise=add_predicted_noise,
             eta=eta,
             generator=generator,
             latents=latents,
@@ -1621,7 +1834,6 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
         negative_prompt: Optional[str] = None,
         negative_prompt_2: Optional[str] = None,
         num_images_per_prompt: Optional[int] = 1,
-        add_predicted_noise: bool = False,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,
@@ -1654,7 +1866,6 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
             negative_prompt=negative_prompt,
             negative_prompt_2=negative_prompt_2,
             num_images_per_prompt=num_images_per_prompt,
-            add_predicted_noise=add_predicted_noise,
             eta=eta,
             generator=generator,
             latents=latents,
@@ -1675,8 +1886,73 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
 
     def inpaint(
         self,
+        prompt: str = None,
+        prompt_2: Optional[str] = None,
+        image: Optional[PipelineImageInput] = None,
+        mask_image: Optional[PipelineImageInput] = None,
+        masked_image_latents: Optional[torch.FloatTensor] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        strength: float = 0.8,
+        num_inference_steps: int = 50,
+        timesteps: List[int] = None,
+        denoising_start: Optional[float] = None,
+        denoising_end: Optional[float] = None,
+        guidance_scale: float = 5.0,
+        negative_prompt: Optional[str] = None,
+        negative_prompt_2: Optional[str] = None,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        callback_steps: int = 1,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        guidance_rescale: float = 0.0,
+        original_size: Optional[Tuple[int, int]] = None,
+        crops_coords_top_left: Tuple[int, int] = (0, 0),
+        target_size: Optional[Tuple[int, int]] = None,
     ):
-        pass
+        return self.__call__(
+            prompt=prompt,
+            prompt_2=prompt_2,
+            image=image,
+            mask_image=mask_image,
+            masked_image_latents=masked_image_latents,
+            height=height,
+            width=width,
+            strength=strength,
+            num_inference_steps=num_inference_steps,
+            timesteps=timesteps,
+            denoising_start=denoising_start,
+            denoising_end=denoising_end,
+            guidance_scale=guidance_scale,
+            negative_prompt=negative_prompt,
+            negative_prompt_2=negative_prompt_2,
+            num_images_per_prompt=num_images_per_prompt,
+            eta=eta,
+            generator=generator,
+            latents=latents,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+            output_type=output_type,
+            return_dict=return_dict,
+            callback=callback,
+            callback_steps=callback_steps,
+            cross_attention_kwargs=cross_attention_kwargs,
+            guidance_rescale=guidance_rescale,
+            original_size=original_size,
+            crops_coords_top_left=crops_coords_top_left,
+            target_size=target_size,
+        )
 
     # Overrride to properly handle the loading and unloading of the additional text encoder.
     def load_lora_weights(self, pretrained_model_name_or_path_or_dict: Union[str, Dict[str, torch.Tensor]], **kwargs):
