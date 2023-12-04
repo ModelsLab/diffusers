@@ -1002,6 +1002,8 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
         return_noise=False,
         return_image_latents=False,
     ):
+        batch_size *= num_images_per_prompt
+
         if image is None:
             shape = (batch_size, num_channels_latents, height // self.vae_scale_factor, width // self.vae_scale_factor)
             if isinstance(generator, list) and len(generator) != batch_size:
@@ -1031,7 +1033,6 @@ class SDXLLongPromptWeightingPipeline(DiffusionPipeline, FromSingleFileMixin, Lo
                 torch.cuda.empty_cache()
 
             image = image.to(device=device, dtype=dtype)
-            batch_size = batch_size * num_images_per_prompt
 
             if image.shape[1] == 4:
                 init_latents = image
